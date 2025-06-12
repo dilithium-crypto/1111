@@ -531,82 +531,8 @@ public:
             return ss.str();
         }
         double last_progress = 0.0;
-        // 比特币生产者线程
-        void bitcoin_producer_thread(MonitoredQueue<std::shared_ptr<ImprovedBatchTask>>& task_queue, double start_percent = 0.0) {
-            // 创建私钥范围对象
-            std::unique_ptr<PrivateKeyRange> key_range;
-            
-            try {
-                // 从配置中获取范围
-                std::string start_hex = bytesToHex(btc_config.start_range);
-                std::string end_hex = bytesToHex(btc_config.end_range);
-                std::string range_str = start_hex + ":" + end_hex;
-                
-                // 使用带百分比的构造函数
-        key_range = std::make_unique<PrivateKeyRange>(range_str, start_percent);
-    } catch (const std::exception& e) {
-        std::cerr << "Error creating private key range: " << e.what() << std::endl;
-        global_state.running = false;
-        return;
-    }
-            
-            ImprovedThreadLocalMemoryPool memory_pool;
-            std::thread cleanup_thread([&memory_pool]() {
-    while (global_state.running) {
-        std::this_thread::sleep_for(std::chrono::seconds(30));
-        memory_pool.periodic_cleanup();
-    }
-});
-            
-            while (global_state.running) {
-                int delay = g_backpressure_controller->getDelayMs();
-                if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-                
-                if (g_backpressure_controller->getState() == BackpressureState::STOP_PRODUCTION) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    continue;
-                }
 
-                auto batch = std::make_shared<ImprovedBatchTask>();
-                
-                // 生成批量私钥，确保在指定范围内
-                std::vector<std::vector<uint8_t>> raw_private_keys;
-                key_range->generateBatch(raw_private_keys, BATCH_SIZE);
-                batch->private_keys = std::move(raw_private_keys);
-
-                
-                // 如果没有生成任何私钥，说明已经到达范围末尾
-                if (batch->private_keys.empty()) {
-                    global_state.running = false;
-                    std::cout << "\n[INFO] Reached end of key range. Stopping production." << std::endl;
-                    break;
-                }
-                
-                global_state.keys_generated += batch->private_keys.size();
-                double current_progress = key_range->get_progress();
-        
-        // 每隔一定进度输出一次（避免频繁输出）
-        if (current_progress - last_progress >= 5.0) {
-            std::cout << "\r[PROGRESS] " << std::fixed << std::setprecision(2) 
-                      << current_progress << "% completed";
-            last_progress = current_progress;
-        }
-                g_backpressure_controller->updateStats(task_queue.size());
-                
-                if (!task_queue.enqueue(batch)) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                }
-            }
-            // 线程结束时输出下次起始百分比
-    double next_start = key_range->get_next_start_percent();
-    std::cout << "\n[Next Start] Continue from: " << std::fixed << std::setprecision(2) 
-              << next_start << "%\n";
-              
-if (cleanup_thread.joinable()) {
-    cleanup_thread.join();
-}
-        }
-        bool parse_wif_private_key(const std::string& wif_private_key, std::vector<uint8_t>& private_key, bool& compressed) {
+    bool parse_wif_private_key(const std::string& wif_private_key, std::vector<uint8_t>& private_key, bool& compressed) {
     try {
         // 1. Base58解码WIF私钥
         uint8_t decoded[100] = {0};
@@ -663,70 +589,115 @@ if (cleanup_thread.joinable()) {
         return false;
     }
 }
-        // 比特币消费者线程
-        void bitcoin_consumer_thread(MonitoredQueue<std::shared_ptr<ImprovedBatchTask>>& task_queue) {
+//比特币生产者线程
+void bitcoin_producer_thread(LockFreeQueue<std::shared_ptr<ImprovedBatchTask>>& task_queue, double start_percent = 0.0) {
+    std::unique_ptr<PrivateKeyRange> key_range;
+    try {
+        std::string start_hex = bytesToHex(btc_config.start_range);
+        std::string end_hex = bytesToHex(btc_config.end_range);
+        std::string range_str = start_hex + ":" + end_hex;
+
+        key_range = std::make_unique<PrivateKeyRange>(range_str, start_percent);
+    } catch (const std::exception& e) {
+        std::cerr << "Error creating private key range: " << e.what() << std::endl;
+        global_state.running = false;
+        return;
+    }
+
+    ImprovedThreadLocalMemoryPool memory_pool;
+    std::thread cleanup_thread([&memory_pool]() {
+        while (global_state.running) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            memory_pool.periodic_cleanup();
+        }
+    });
+
+    double last_progress = key_range->get_progress();
+
     while (global_state.running) {
+        // 背压控制器：主动delay
+        int delay = g_backpressure_controller->getDelayMs();
+        if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+
+        if (g_backpressure_controller->getState() == BackpressureState::STOP_PRODUCTION) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+
+        auto batch = std::make_shared<ImprovedBatchTask>();
+        std::vector<std::vector<uint8_t>> raw_private_keys;
+        key_range->generateBatch(raw_private_keys, BATCH_SIZE);
+        batch->private_keys = std::move(raw_private_keys);
+
+        if (batch->private_keys.empty()) {
+            global_state.running = false;
+            std::cout << "\n[INFO] Reached end of key range. Stopping production." << std::endl;
+
+            // 发送结束标志（nullptr）通知所有消费者退出
+            for (int i = 0; i < CONSUMER_THREADS; ++i) {
+                task_queue.enqueue(nullptr);
+            }
+            break;
+        }
+
+        task_queue.enqueue(batch);
+
+        // 安全更新计数器，线程安全用原子
+        global_state.keys_generated.fetch_add(batch->private_keys.size(), std::memory_order_relaxed);
+
+        double current_progress = key_range->get_progress();
+        if (current_progress - last_progress >= 5.0) {
+            std::cout << "\r[PROGRESS] " << std::fixed << std::setprecision(2)
+                      << current_progress << "% completed" << std::flush;
+            last_progress = current_progress;
+        }
+
+        g_backpressure_controller->updateStats(task_queue.size());
+    }
+
+    if (cleanup_thread.joinable()) {
+        cleanup_thread.join();
+    }
+
+    double next_start = key_range->get_next_start_percent();
+    std::cout << "\n[Next Start] Continue from: " << std::fixed << std::setprecision(2)
+              << next_start << "%\n";
+}
+
+// 比特币消费者线程
+void bitcoin_consumer_thread(LockFreeQueue<std::shared_ptr<ImprovedBatchTask>>& task_queue) {
+    while (true) {
         std::shared_ptr<ImprovedBatchTask> batch;
-        if (!task_queue.dequeue(batch)) continue;
-        
+        task_queue.dequeue(batch);
+
+        // 收到退出信号，batch == nullptr
+        if (!batch) break;
+
         batch->addresses.resize(batch->private_keys.size());
-        
+
         for (size_t i = 0; i < batch->private_keys.size(); ++i) {
             try {
-                // 从WIF格式解析私钥
-                std::vector<uint8_t> private_key;
+                std::vector<uint8_t> private_key = batch->private_keys[i];
                 bool compressed = btc_config.use_compressed;
-                
-                private_key = batch->private_keys[i];
+
                 auto public_key = private_to_public_avx2(private_key, compressed);
                 batch->addresses[i] = public_to_bitcoin(public_key, compressed);
 
-                    
-                    // 清理生成的地址
-                    std::string cleaned_address = clean_address(batch->addresses[i]);
-                    
-                    global_state.addresses_checked++;
-                    
-                    // 检查是否匹配任何目标地址
-                    if (global_state.target_addresses.count(cleaned_address) > 0) {
-                        std::lock_guard<std::mutex> lock(global_state.file_mutex);
-                        std::ofstream out(btc_config.result_file, std::ios::app);
-                        if (out) {
-                            out << "Match found!\n";
-                            out << "Private Key: ";
-                            for (auto b : private_key) {
-                                out << std::hex << std::setw(2) << std::setfill('0') << (int)b;
-                            }
-                            out << "\nAddress: " << cleaned_address << "\n\n";
+                std::string cleaned_address = clean_address(batch->addresses[i]);
+
+                global_state.addresses_checked.fetch_add(1, std::memory_order_relaxed);
+
+                if (global_state.target_addresses.count(cleaned_address) > 0) {
+                    std::lock_guard<std::mutex> lock(global_state.file_mutex);
+                    std::ofstream out(btc_config.result_file, std::ios::app);
+                    if (out) {
+                        out << "Match found!\nPrivate Key: ";
+                        for (auto b : private_key) {
+                            out << std::hex << std::setw(2) << std::setfill('0') << (int)b;
                         }
-                        global_state.matches_found++;
-                        // 继续搜索其他匹配，而不是立即停止
-                    
-                } else {
-                    // WIF解析失败，尝试直接使用原始私钥（如果是字节数组格式）
-                    auto public_key = private_to_public_avx2(batch->private_keys[i], compressed);
-                    batch->addresses[i] = public_to_bitcoin(public_key, compressed);
-                    
-                    // 清理生成的地址
-                    std::string cleaned_address = clean_address(batch->addresses[i]);
-                    
-                    global_state.addresses_checked++;
-                    
-                    // 检查是否匹配任何目标地址
-                    if (global_state.target_addresses.count(cleaned_address) > 0) {
-                        std::lock_guard<std::mutex> lock(global_state.file_mutex);
-                        std::ofstream out(btc_config.result_file, std::ios::app);
-                        if (out) {
-                            out << "Match found!\n";
-                            out << "Private Key: ";
-                            for (auto b : batch->private_keys[i]) {
-                                out << std::hex << std::setw(2) << std::setfill('0') << (int)b;
-                            }
-                            out << "\nAddress: " << cleaned_address << "\n\n";
-                        }
-                        global_state.matches_found++;
-                        // 继续搜索其他匹配，而不是立即停止
+                        out << "\nAddress: " << cleaned_address << "\n\n";
                     }
+                    global_state.matches_found.fetch_add(1, std::memory_order_relaxed);
                 }
             } catch (...) {
                 // 错误处理
@@ -734,6 +705,7 @@ if (cleanup_thread.joinable()) {
         }
     }
 }
+
 
         // 比特币监控线程
         void bitcoin_monitor_thread() {
@@ -968,13 +940,13 @@ int main(int argc, char* argv[]) {
     global_state.result_file = btc_config.result_file;
     
     // 创建监控队列
-    MonitoredQueue<std::shared_ptr<ImprovedBatchTask>> task_queue;
+    LockFreeQueue<std::shared_ptr<ImprovedBatchTask>> task_queue(16384);
 
     // 创建并启动线程
     std::vector<std::thread> producer_threads;
     for (size_t i = 0; i < PRODUCER_THREADS; ++i) {
-    producer_threads.emplace_back(bitcoin_producer_thread, std::ref(task_queue), start_percent);
-}
+        producer_threads.emplace_back(bitcoin_producer_thread, std::ref(task_queue), start_percent);
+    }
 
     std::vector<std::thread> consumer_threads;
     std::vector<std::thread> monitor_threads;
@@ -1005,7 +977,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[INFO] Output file: " << btc_config.result_file << std::endl;
     std::cout << "[INFO] Memory pool size: " << MEMORY_POOL_MAX_SIZE / (1024*1024) << " MB" << std::endl;
 
-    // 等待生产者线程结束
+    // *** 等待生产者线程结束
     for (auto& t : producer_threads) {
         if (t.joinable()) {
             t.join();
@@ -1013,7 +985,13 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "\n[INFO] All producer threads have exited" << std::endl;
 
-    // 清空队列
+    // *** 给消费者线程发送退出信号（nullptr）
+    for (size_t i = 0; i < consumer_threads.size(); ++i) {
+        while (!task_queue.enqueue(nullptr)) {
+            std::this_thread::yield();
+        }
+    }
+
     size_t remaining_tasks = 0;
     while (!task_queue.empty()) {
         std::shared_ptr<ImprovedBatchTask> batch;
@@ -1024,37 +1002,29 @@ int main(int argc, char* argv[]) {
             remaining_tasks++;
         }
     }
-    std::cout << "[INFO] Cleared " << remaining_tasks << " remaining tasks from queue" << std::endl;
-    
-    // 停止消费者和监控线程
-    global_state.running = false;
-    
-    // 等待消费者线程结束
+    if (remaining_tasks > 0) {
+        std::cout << "[INFO] Cleared " << remaining_tasks << " remaining tasks in queue" << std::endl;
+    }
+
+    // *** 等待消费者线程退出
     for (auto& t : consumer_threads) {
         if (t.joinable()) {
             t.join();
         }
     }
     std::cout << "[INFO] All consumer threads have exited" << std::endl;
-    
-    // 等待监控线程结束
+
+    // 停止运行，通知监控线程退出
+    global_state.running = false;
+
+    // 等待监控线程退出
     for (auto& t : monitor_threads) {
         if (t.joinable()) {
             t.join();
         }
     }
     std::cout << "[INFO] All monitor threads have exited" << std::endl;
-    
-    cleanup_openssl();
-    
-    std::cout << "\nProgram terminated. Total addresses checked: " 
-              << global_state.addresses_checked.load() << std::endl;
-    
-    if (global_state.matches_found > 0) {
-        std::cout << "MATCH FOUND! Results saved to: " << btc_config.result_file << std::endl;
-    } else {
-        std::cout << "No matches found for the specified range." << std::endl;
-    }
-    
+
+    std::cout << "[INFO] Program terminated gracefully." << std::endl;
     return 0;
 }
