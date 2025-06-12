@@ -13,9 +13,9 @@
 #include <condition_variable>
 #include <sodium.h>
 #include <sys/sysinfo.h>
-
+#include <cassert>
 // 必须添加常量定义
-constexpr size_t BATCH_SIZE = 64;
+constexpr size_t BATCH_SIZE = 128;
 constexpr size_t DERIVED_KEYS_PER_SEED = 5;
 
 // 改进BatchTask的内存管理
@@ -127,46 +127,60 @@ private:
 };
 
 // MonitoredQueue 模板：用于监控任务队列长度
-template <typename T>
-class MonitoredQueue {
+template<typename T>
+class LockFreeQueue {
 public:
-    MonitoredQueue() {}
-
-    void push(const T& item) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        queue_.push(item);
+    explicit LockFreeQueue(size_t capacity)
+        : capacity_(capacity), buffer_(capacity) {
+        assert((capacity & (capacity - 1)) == 0 && "Capacity must be power of 2.");
+        head_.store(0);
+        tail_.store(0);
     }
 
-    bool try_pop(T& item) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (queue_.empty()) return false;
-        item = std::move(queue_.front());
-        queue_.pop();
+    // 多线程安全入队，成功返回 true，失败（队列满）返回 false
+    bool enqueue(const T& item) {
+        size_t tail = tail_.load(std::memory_order_relaxed);
+        size_t next_tail = increment(tail);
+        if (next_tail == head_.load(std::memory_order_acquire)) {
+            return false; // full
+        }
+        buffer_[tail] = item;
+        tail_.store(next_tail, std::memory_order_release);
         return true;
     }
-    
-    bool enqueue(const T& item) {
-    push(item);
-    return true;  // 可扩展为满队列时返回 false
-    }
 
+    // 多线程安全出队，成功将 item 设置为队首元素，返回 true，失败（空）返回 false
     bool dequeue(T& item) {
-    return try_pop(item);
+        size_t head = head_.load(std::memory_order_relaxed);
+        if (head == tail_.load(std::memory_order_acquire)) {
+            return false; // empty
+        }
+        item = buffer_[head];
+        head_.store(increment(head), std::memory_order_release);
+        return true;
     }
 
     size_t size() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return queue_.size();
+        size_t tail = tail_.load(std::memory_order_acquire);
+        size_t head = head_.load(std::memory_order_acquire);
+        return (tail + capacity_ - head) & (capacity_ - 1);
     }
 
-    bool empty() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        return queue_.empty();
+    size_t capacity() const {
+        return capacity_ - 1;
     }
+    bool empty() const {
+    return size() == 0;
+}
 
 private:
-    mutable std::mutex mutex_;
-    std::queue<T> queue_;
-};
+    size_t increment(size_t idx) const {
+        return (idx + 1) & (capacity_ - 1);
+    }
 
+    const size_t capacity_;
+    std::vector<T> buffer_;
+    std::atomic<size_t> head_;
+    std::atomic<size_t> tail_;
+};
 #endif // BACKPRESSURE_H
